@@ -9,7 +9,7 @@ from utils.db import db_manager
 from pipeline.downloader import run_downloader
 from pipeline.extract import run_extractor
 from pipeline.countlines import run_counter
-from pipeline.loader import run_loader
+from pipeline.loaderSolars import run_loader
 
 load_dotenv()
 
