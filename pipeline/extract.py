@@ -1,4 +1,5 @@
 import os
+import shutil
 import zipfile
 import concurrent.futures
 import time
@@ -52,13 +53,15 @@ class Extractor:
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 total_size = sum(info.file_size for info in zip_ref.infolist())
 
-                # Verificar espaço disponível no diretório de destino
-                drive_stats = os.statvfs(self.output_path)
-                free_space = drive_stats.f_frsize * drive_stats.f_bavail
-
-                if total_size > free_space:
-                    logger.error(f"Espaço insuficiente para extrair {zip_file}. Necessário: {total_size/1024**2:.2f} MB, Disponível: {free_space/1024**2:.2f} MB")
-                    return False
+                # Verificar espaço disponível usando shutil (compatível com Windows, Mac e Linux)
+                try:
+                    free_space = shutil.disk_usage(self.output_path).free
+                    if total_size > free_space:
+                        logger.error(f"Espaço insuficiente para extrair {zip_file}. Necessário: {total_size/1024**2:.2f} MB, Disponível: {free_space/1024**2:.2f} MB")
+                        return False
+                except Exception as e:
+                    # Se não conseguir verificar o espaço, apenas registra aviso e continua
+                    logger.warning(f"Não foi possível verificar espaço em disco: {str(e)}")
         except Exception as e:
             logger.error(f"Erro ao verificar tamanho do arquivo ZIP {zip_file}", exception=e)
             return False
@@ -137,6 +140,11 @@ def run_extractor():
         extractor = Extractor()
         successful, failed = extractor.extract_all_files()
         logger.end_timer("extract_all_files", timer_start)
+
+        # Verificar se todos os arquivos falharam e se havia arquivos para extrair
+        if len(successful) == 0 and len(failed) > 0:
+            logger.error("Todas as extrações falharam")
+            return 0, len(failed)
 
         return len(successful), len(failed)
     except Exception as e:
