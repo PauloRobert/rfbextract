@@ -150,7 +150,7 @@ class DataLoader:
             df = pl.scan_csv(
                 file_path,
                 separator=';',
-                encoding='latin-1',
+                encoding='utf8',
                 has_header=True,
                 dtypes=schema,
                 low_memory=True,
@@ -176,7 +176,7 @@ class DataLoader:
             # Estimativa inicial do tamanho total
             try:
                 file_size = os.path.getsize(file_path)
-                sample_df = pl.read_csv(file_path, separator=';', encoding='latin-1', n_rows=1000)
+                sample_df = pl.read_csv(file_path, separator=';', encoding='utf8', n_rows=1000)
                 avg_row_size = file_size / (len(sample_df) + 1)  # +1 para o cabeçalho
                 estimated_rows = int(file_size / avg_row_size)
                 logger.info(f"Tamanho estimado: {estimated_rows:,} linhas")

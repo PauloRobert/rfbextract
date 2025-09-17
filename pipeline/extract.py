@@ -17,23 +17,53 @@ EXTRACTED_FILES_PATH = os.getenv('EXTRACTED_FILES_PATH')
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 8))
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', 5))
 RETRY_DELAY = int(os.getenv('RETRY_DELAY', 10))
+# Controle opcional para remover o arquivo ZIP original após extração (padrão: True)
+DELETE_ARCHIVE_AFTER_EXTRACT = os.getenv('DELETE_ARCHIVE_AFTER_EXTRACT', 'true').lower() in ('1', 'true', 'yes')
+
 
 class Extractor:
-    def __init__(self, input_path: str = None, output_path: str = None):
+    """Classe responsável por extrair arquivos ZIP encontrados em OUTPUT_FILES_PATH
+
+    Alterações importantes nesta versão:
+    - Remove o arquivo .zip original logo após a extração bem-sucedida (controle via DELETE_ARCHIVE_AFTER_EXTRACT)
+    - Mantém compatibilidade com a API existente (mesmos métodos públicos)
+    """
+
+    def __init__(self, input_path: str = None, output_path: str = None, delete_archive: bool = None):
         self.input_path = input_path or OUTPUT_FILES_PATH
         self.output_path = output_path or EXTRACTED_FILES_PATH
+        # Se delete_archive for fornecido, prevalece; caso contrário usa a env var
+        self.delete_archive = DELETE_ARCHIVE_AFTER_EXTRACT if delete_archive is None else bool(delete_archive)
+
         Path(self.output_path).mkdir(parents=True, exist_ok=True)
 
     def get_zip_files(self) -> List[str]:
         zip_files = []
+        if not self.input_path or not os.path.isdir(self.input_path):
+            logger.warning(f"Input path inválido ou inexistente: {self.input_path}")
+            return zip_files
+
         for item in os.listdir(self.input_path):
-            if item.endswith('.zip'):
+            if item.lower().endswith('.zip'):
                 zip_files.append(item)
 
         if not zip_files:
             logger.warning(f"Nenhum arquivo .zip encontrado em {self.input_path}")
 
         return zip_files
+
+    def _safe_remove(self, file_path: str) -> bool:
+        """Tenta remover o arquivo e loga adequadamente. Retorna True se removido ou inexistente."""
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Arquivo removido após extração: {file_path}")
+            else:
+                logger.debug(f"Arquivo já inexistente ao tentar remover: {file_path}")
+            return True
+        except Exception as e:
+            logger.warning(f"Falha ao remover arquivo {file_path}: {e}",)
+            return False
 
     def extract_file(self, zip_file: str) -> bool:
         file_path = os.path.join(self.input_path, zip_file)
@@ -48,7 +78,7 @@ class Extractor:
             logger.error(f"Arquivo {file_path} não é um arquivo ZIP válido")
             return False
 
-        # Verificar espaço em disco disponível
+        # Verificar espaço em disco disponível (estimativa com base no tamanho dos membros)
         try:
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
                 total_size = sum(info.file_size for info in zip_ref.infolist())
@@ -57,13 +87,15 @@ class Extractor:
                 try:
                     free_space = shutil.disk_usage(self.output_path).free
                     if total_size > free_space:
-                        logger.error(f"Espaço insuficiente para extrair {zip_file}. Necessário: {total_size/1024**2:.2f} MB, Disponível: {free_space/1024**2:.2f} MB")
+                        logger.error(
+                            f"Espaço insuficiente para extrair {zip_file}. Necessário: {total_size/1024**2:.2f} MB, Disponível: {free_space/1024**2:.2f} MB"
+                        )
                         return False
                 except Exception as e:
                     # Se não conseguir verificar o espaço, apenas registra aviso e continua
                     logger.warning(f"Não foi possível verificar espaço em disco: {str(e)}")
         except Exception as e:
-            logger.error(f"Erro ao verificar tamanho do arquivo ZIP {zip_file}", exception=e)
+            logger.error(f"Erro ao verificar tamanho do arquivo ZIP {zip_file}",)
             return False
 
         # Extrair o arquivo com retentativas
@@ -94,15 +126,24 @@ class Extractor:
                             logger.info(f"Extração {zip_file}: {i}/{total_files} arquivos ({progress:.1f}%) - {speed:.2f} MB/s")
 
                 logger.info(f"Extração completa: {zip_file}")
+
+                # Remover o arquivo ZIP original para economizar espaço, se configurado
+                if self.delete_archive:
+                    removed = self._safe_remove(file_path)
+                    if not removed:
+                        logger.warning(f"Não foi possível remover o arquivo de origem {file_path} após extração")
+                else:
+                    logger.debug(f"Remoção do arquivo ZIP desabilitada por configuração: {file_path}")
+
                 return True
 
             except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as e:
                 if attempt < MAX_RETRIES - 1:
                     wait_time = RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Erro na extração de {zip_file}. Aguardando {wait_time}s para nova tentativa.", exception=e)
+                    logger.warning(f"Erro na extração de {zip_file}. Aguardando {wait_time}s para nova tentativa.",)
                     time.sleep(wait_time)
                 else:
-                    logger.error(f"Falha na extração de {zip_file} após {MAX_RETRIES} tentativas", exception=e)
+                    logger.error(f"Falha na extração de {zip_file} após {MAX_RETRIES} tentativas",)
                     return False
 
         return False
@@ -125,7 +166,7 @@ class Extractor:
                     else:
                         failed.add(file)
                 except Exception as e:
-                    logger.error(f"Erro no processamento de {file}", exception=e)
+                    logger.error(f"Erro no processamento de {file}",)
                     failed.add(file)
 
         if failed:
@@ -133,6 +174,7 @@ class Extractor:
 
         logger.info(f"Extrações concluídas: {len(successful)} sucesso, {len(failed)} falhas")
         return successful, failed
+
 
 def run_extractor():
     try:
@@ -148,8 +190,9 @@ def run_extractor():
 
         return len(successful), len(failed)
     except Exception as e:
-        logger.critical("Falha crítica no processo de extração", exception=e)
+        logger.critical("Falha crítica no processo de extração",)
         return 0, 0
+
 
 if __name__ == "__main__":
     run_extractor()

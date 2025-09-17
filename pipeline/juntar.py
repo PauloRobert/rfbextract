@@ -19,6 +19,7 @@ MAX_WORKERS = int(os.getenv('MAX_WORKERS', 8))
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', 5))
 BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer para cópia
 
+
 class FileMerger:
     def __init__(self, input_path: str = None, output_path: str = None):
         self.input_path = input_path or EXTRACTED_FILES_PATH
@@ -29,31 +30,41 @@ class FileMerger:
         Path(self.temp_path).mkdir(parents=True, exist_ok=True)
 
     def find_multipart_files(self) -> Dict[str, List[str]]:
-        # Padrão para arquivos multipartes, ex: ESTABELE1.PARTE00, ESTABELE1.PARTE01
-        pattern = re.compile(r'(.+)\.PARTE(\d+)')
+        """Encontra arquivos multipartes automaticamente, independente do padrão usado pela RFB.
+
+        Estratégia:
+        - Detecta qualquer arquivo que termine com um sufixo sequencial (ex: 01, 02, Y0, Y1, etc).
+        - Agrupa arquivos pelo prefixo comum e extensão.
+        - Ordena as partes pela sequência numérica/alfa-numérica.
+        """
+        pattern = re.compile(r"(.+?)([A-Z]?\d+)(\.[^.]+)?$", re.IGNORECASE)
 
         files_by_prefix = defaultdict(list)
 
         for file in os.listdir(self.input_path):
             match = pattern.match(file)
             if match:
-                prefix, part_num = match.groups()
-                files_by_prefix[prefix].append((int(part_num), file))
+                prefix, seq, ext = match.groups()
+                key = f"{prefix}{ext or ''}"  # prefixo base + extensão
+                try:
+                    # Remover letras e pegar apenas parte numérica, ex: Y12 -> 12
+                    num_seq = int(re.sub(r"[^0-9]", "", seq))
+                except ValueError:
+                    continue
+                files_by_prefix[key].append((num_seq, file))
 
-        # Ordenar as partes por número para cada prefixo
         result = {}
         for prefix, parts in files_by_prefix.items():
-            if len(parts) > 1:  # Considerar apenas arquivos com múltiplas partes
+            if len(parts) > 1:
                 sorted_parts = [p[1] for p in sorted(parts, key=lambda x: x[0])]
                 result[prefix] = sorted_parts
 
         return result
 
     def merge_file_parts(self, prefix: str, parts: List[str]) -> bool:
-        output_file = os.path.join(self.output_path, f"{prefix}.csv")
-        temp_output = os.path.join(self.temp_path, f"{prefix}_temp.csv")
+        output_file = os.path.join(self.output_path, f"{Path(prefix).stem}.csv")
+        temp_output = os.path.join(self.temp_path, f"{Path(prefix).stem}_temp.csv")
 
-        # Verificar se o arquivo já existe e tem o tamanho correto
         if os.path.exists(output_file):
             expected_size = sum(os.path.getsize(os.path.join(self.input_path, part)) for part in parts)
             if os.path.getsize(output_file) == expected_size:
@@ -73,7 +84,6 @@ class FileMerger:
                     part_size = os.path.getsize(part_path)
 
                     with open(part_path, 'rb') as infile:
-                        # Copiar em blocos para eficiência
                         while True:
                             buffer = infile.read(BUFFER_SIZE)
                             if not buffer:
@@ -83,14 +93,12 @@ class FileMerger:
                     processed_size += part_size
                     progress = (processed_size / total_size) * 100
                     elapsed = time.time() - start_time
-                    speed = processed_size / (elapsed * 1024 * 1024) if elapsed > 0 else 0  # MB/s
+                    speed = processed_size / (elapsed * 1024 * 1024) if elapsed > 0 else 0
 
                     logger.info(f"Junção {prefix}: {i+1}/{len(parts)} partes ({progress:.1f}%) - {speed:.2f} MB/s")
 
-            # Mover o arquivo temporário para o destino final
             shutil.move(temp_output, output_file)
 
-            # Remover os arquivos de partes após a junção bem-sucedida
             for part in parts:
                 os.remove(os.path.join(self.input_path, part))
 
@@ -99,18 +107,15 @@ class FileMerger:
 
         except Exception as e:
             logger.error(f"Erro ao juntar partes de {prefix}", exception=e)
-
-            # Limpar arquivo temporário em caso de erro
             if os.path.exists(temp_output):
                 os.remove(temp_output)
-
             return False
 
     def merge_all_multipart_files(self) -> Tuple[Set[str], Set[str]]:
         multipart_files = self.find_multipart_files()
 
         if not multipart_files:
-            logger.info("Nenhum arquivo multipartes encontrado")
+            logger.info("Nenhum arquivo multipartes encontrado. Seguindo para próxima etapa (split).")
             return set(), set()
 
         logger.info(f"Encontrados {len(multipart_files)} arquivos multipartes para junção")
@@ -141,6 +146,7 @@ class FileMerger:
         logger.info(f"Junções concluídas: {len(successful)} sucesso, {len(failed)} falhas")
         return successful, failed
 
+
 def run_merger():
     try:
         timer_start = logger.start_timer("merge_all_multipart_files")
@@ -152,6 +158,7 @@ def run_merger():
     except Exception as e:
         logger.critical("Falha crítica no processo de junção de arquivos", exception=e)
         return 0, 0
+
 
 if __name__ == "__main__":
     run_merger()

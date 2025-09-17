@@ -1,12 +1,10 @@
 import os
-import mmap
 import concurrent.futures
 import time
 from pathlib import Path
-from typing import List, Dict, Set, Tuple
+from typing import Set, Tuple
 
 from dotenv import load_dotenv
-
 from utils.logging import logger
 
 load_dotenv()
@@ -14,7 +12,8 @@ load_dotenv()
 EXTRACTED_FILES_PATH = os.getenv('EXTRACTED_FILES_PATH')
 TEMP_PATH = os.getenv('TEMP_PATH')
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 8))
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 1000000))  # Linhas por chunk
+MAX_CHUNK_SIZE_MB = int(os.getenv('MAX_CHUNK_SIZE_MB', 100))  # Novo parâmetro
+MAX_CHUNK_SIZE = MAX_CHUNK_SIZE_MB * 1024 * 1024  # Convertendo para bytes
 
 class FileSplitter:
     def __init__(self, input_path: str = None, output_path: str = None):
@@ -22,115 +21,101 @@ class FileSplitter:
         self.output_path = output_path or TEMP_PATH
         Path(self.output_path).mkdir(parents=True, exist_ok=True)
 
-    def count_lines(self, file_path: str) -> int:
-        with open(file_path, 'rb') as f:
-            # Usar mmap para contagem eficiente de linhas em arquivos grandes
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            line_count = 0
-
-            # Contar bytes de nova linha
-            line_count = mm.read().count(b'\n')
-            mm.close()
-
-            # Ajustar para o caso de o arquivo não terminar com nova linha
-            if os.path.getsize(file_path) > 0 and line_count == 0:
-                line_count = 1
-
-            return line_count
-
-    def find_large_files(self, min_lines: int = CHUNK_SIZE) -> List[str]:
-        large_files = []
-
-        for file in os.listdir(self.input_path):
-            if file.endswith('.csv'):
-                file_path = os.path.join(self.input_path, file)
-                try:
-                    line_count = self.count_lines(file_path)
-                    if line_count > min_lines:
-                        large_files.append((file, line_count))
-                        logger.info(f"Arquivo grande encontrado: {file} ({line_count:,} linhas)")
-                except Exception as e:
-                    logger.error(f"Erro ao verificar arquivo {file}", exception=e)
-
-        return large_files
-
     def get_file_header(self, file_path: str) -> str:
-        with open(file_path, 'r', encoding='latin-1') as f:
+        """Retorna a primeira linha do arquivo como cabeçalho"""
+        with open(file_path, 'r', encoding='utf8') as f:
             return f.readline().strip()
 
-    def split_file(self, file_info: Tuple[str, int]) -> bool:
-        file_name, total_lines = file_info
+    def split_file_by_size(self, file_name: str) -> bool:
+        """Divide o arquivo em chunks de no máximo MAX_CHUNK_SIZE bytes"""
         file_path = os.path.join(self.input_path, file_name)
         base_name = os.path.splitext(file_name)[0]
 
-        # Verificar se o arquivo existe
         if not os.path.exists(file_path):
             logger.error(f"Arquivo {file_path} não existe")
             return False
 
+        if os.path.getsize(file_path) == 0:
+            logger.warning(f"Arquivo {file_name} está vazio, ignorando")
+            return False
+
         try:
             start_time = time.time()
-            logger.info(f"Iniciando divisão de {file_name} ({total_lines:,} linhas)")
+            logger.info(f"Iniciando divisão de {file_name} por tamanho (max {MAX_CHUNK_SIZE_MB} MB)")
 
-            # Obter o cabeçalho do arquivo
             header = self.get_file_header(file_path)
 
-            # Calcular número de chunks
-            num_chunks = (total_lines + CHUNK_SIZE - 1) // CHUNK_SIZE
+            chunk_num = 1
+            current_chunk_size = 0
+            chunk_file = os.path.join(self.output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
+            outfile = open(chunk_file, 'w', encoding='utf8')
+            outfile.write(f"{header}\n")
+            lines_written = 0
 
-            # Abrir o arquivo de entrada
-            with open(file_path, 'r', encoding='latin-1') as infile:
-                # Pular o cabeçalho no arquivo de entrada (já foi lido)
-                next(infile)
+            with open(file_path, 'r', encoding='utf8') as infile:
+                next(infile)  # pular cabeçalho
 
-                for chunk_num in range(num_chunks):
-                    chunk_file = os.path.join(self.output_path, f"{base_name}_chunk_{chunk_num+1:03d}.csv")
+                for line in infile:
+                    outfile.write(line)
+                    current_chunk_size += len(line.encode('utf8'))
+                    lines_written += 1
 
-                    with open(chunk_file, 'w', encoding='latin-1') as outfile:
-                        # Escrever o cabeçalho em cada chunk
+                    if current_chunk_size >= MAX_CHUNK_SIZE:
+                        outfile.close()
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"{file_name}: chunk {chunk_num} concluído "
+                            f"({current_chunk_size / 1024 ** 2:.2f} MB, {lines_written} linhas) - "
+                            f"{lines_written / elapsed:.0f} linhas/s"
+                        )
+
+                        # Próximo chunk
+                        chunk_num += 1
+                        chunk_file = os.path.join(self.output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
+                        outfile = open(chunk_file, 'w', encoding='utf8')
                         outfile.write(f"{header}\n")
-
-                        # Escrever as linhas do chunk
+                        current_chunk_size = 0
                         lines_written = 0
-                        for _ in range(CHUNK_SIZE):
-                            line = infile.readline()
-                            if not line:
-                                break
 
-                            outfile.write(line)
-                            lines_written += 1
+            # Fechar último chunk se estiver aberto
+            if not outfile.closed:
+                outfile.close()
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"{file_name}: chunk {chunk_num} concluído "
+                    f"({current_chunk_size / 1024 ** 2:.2f} MB, {lines_written} linhas)"
+                )
 
-                    # Calcular progresso
-                    progress = min(100, ((chunk_num + 1) * CHUNK_SIZE / total_lines) * 100)
-                    elapsed = time.time() - start_time
-                    speed = ((chunk_num + 1) * CHUNK_SIZE) / elapsed if elapsed > 0 else 0
-
-                    logger.info(f"Divisão {file_name}: chunk {chunk_num+1}/{num_chunks} ({progress:.1f}%) - {speed:.0f} linhas/s")
-
-            logger.info(f"Divisão completa: {file_name} em {num_chunks} chunks")
+            logger.info(f"Divisão completa de {file_name} em {chunk_num} chunks")
             return True
 
         except Exception as e:
             logger.error(f"Erro ao dividir arquivo {file_name}", exception=e)
             return False
 
-    def split_all_large_files(self) -> Tuple[Set[str], Set[str]]:
-        large_files = self.find_large_files()
+    def split_all_files(self) -> Tuple[Set[str], Set[str]]:
+        """Divide todos os arquivos do diretório de input, respeitando MAX_CHUNK_SIZE"""
+        files_to_split = [
+            f for f in os.listdir(self.input_path)
+            if os.path.isfile(os.path.join(self.input_path, f)) and os.path.getsize(os.path.join(self.input_path, f)) > 0
+        ]
 
-        if not large_files:
-            logger.info("Nenhum arquivo grande encontrado para divisão")
+        if not files_to_split:
+            logger.info("Nenhum arquivo encontrado para divisão")
             return set(), set()
-
-        logger.info(f"Encontrados {len(large_files)} arquivos grandes para divisão")
 
         successful = set()
         failed = set()
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_file = {
-                executor.submit(self.split_file, file_info): file_info[0]
-                for file_info in large_files
-            }
+            future_to_file = {}
+            for f in files_to_split:
+                file_path = os.path.join(self.input_path, f)
+                if os.path.getsize(file_path) <= MAX_CHUNK_SIZE:
+                    logger.info(f"Arquivo {f} menor que {MAX_CHUNK_SIZE_MB} MB, passando para próxima etapa")
+                    successful.add(f)
+                    continue
+                future_to_file[executor.submit(self.split_file_by_size, f)] = f
 
             for future in concurrent.futures.as_completed(future_to_file):
                 file = future_to_file[future]
@@ -149,17 +134,19 @@ class FileSplitter:
         logger.info(f"Divisões concluídas: {len(successful)} sucesso, {len(failed)} falhas")
         return successful, failed
 
+
 def run_splitter():
     try:
-        timer_start = logger.start_timer("split_all_large_files")
+        timer_start = logger.start_timer("split_all_files")
         splitter = FileSplitter()
-        successful, failed = splitter.split_all_large_files()
-        logger.end_timer("split_all_large_files", timer_start)
+        successful, failed = splitter.split_all_files()
+        logger.end_timer("split_all_files", timer_start)
 
         return len(successful), len(failed)
     except Exception as e:
         logger.critical("Falha crítica no processo de divisão de arquivos", exception=e)
         return 0, 0
+
 
 if __name__ == "__main__":
     run_splitter()
