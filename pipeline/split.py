@@ -12,72 +12,55 @@ load_dotenv()
 EXTRACTED_FILES_PATH = os.getenv('EXTRACTED_FILES_PATH')
 TEMP_PATH = os.getenv('TEMP_PATH')
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 8))
-MAX_CHUNK_SIZE_MB = int(os.getenv('MAX_CHUNK_SIZE_MB', 100))  # Novo parâmetro
-MAX_CHUNK_SIZE = MAX_CHUNK_SIZE_MB * 1024 * 1024  # Convertendo para bytes
+MAX_CHUNK_SIZE_MB = int(os.getenv('MAX_CHUNK_SIZE_MB', 100))
+MAX_CHUNK_SIZE = MAX_CHUNK_SIZE_MB * 1024 * 1024  # bytes
 
-class FileSplitter:
-    def __init__(self, input_path: str = None, output_path: str = None):
-        self.input_path = input_path or EXTRACTED_FILES_PATH
-        self.output_path = output_path or TEMP_PATH
-        Path(self.output_path).mkdir(parents=True, exist_ok=True)
 
-    def get_file_header(self, file_path: str) -> str:
-        """Retorna a primeira linha do arquivo como cabeçalho"""
-        with open(file_path, 'r', encoding='utf8') as f:
-            return f.readline().strip()
+def split_file_global(file_path: str, output_path: str, max_chunk_size: int) -> bool:
+    """
+    Função global para dividir um arquivo em chunks.
+    Cada chunk terá no máximo max_chunk_size bytes.
+    O arquivo original será deletado ao final.
+    """
+    try:
+        import os
+        import time
+        from utils.logging import logger
 
-    def split_file_by_size(self, file_name: str) -> bool:
-        """Divide o arquivo em chunks de no máximo MAX_CHUNK_SIZE bytes"""
-        file_path = os.path.join(self.input_path, file_name)
+        file_name = os.path.basename(file_path)
         base_name = os.path.splitext(file_name)[0]
+        start_time = time.time()
+        logger.info(f"Iniciando divisão de {file_name} (max {max_chunk_size / 1024 ** 2:.2f} MB)")
 
-        if not os.path.exists(file_path):
-            logger.error(f"Arquivo {file_path} não existe")
-            return False
-
-        if os.path.getsize(file_path) == 0:
-            logger.warning(f"Arquivo {file_name} está vazio, ignorando")
-            return False
-
-        try:
-            start_time = time.time()
-            logger.info(f"Iniciando divisão de {file_name} por tamanho (max {MAX_CHUNK_SIZE_MB} MB)")
-
-            header = self.get_file_header(file_path)
-
+        with open(file_path, 'r', encoding='latin-1') as infile:
+            header = infile.readline().strip()
             chunk_num = 1
             current_chunk_size = 0
-            chunk_file = os.path.join(self.output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
-            outfile = open(chunk_file, 'w', encoding='utf8')
-            outfile.write(f"{header}\n")
+            chunk_file = os.path.join(output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
+            outfile = open(chunk_file, 'w', encoding='latin-1')
+            outfile.write(header + "\n")
             lines_written = 0
 
-            with open(file_path, 'r', encoding='utf8') as infile:
-                next(infile)  # pular cabeçalho
+            for line in infile:
+                outfile.write(line)
+                current_chunk_size += len(line.encode('latin-1'))
+                lines_written += 1
 
-                for line in infile:
-                    outfile.write(line)
-                    current_chunk_size += len(line.encode('utf8'))
-                    lines_written += 1
+                if current_chunk_size >= max_chunk_size:
+                    outfile.close()
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"{file_name}: chunk {chunk_num} concluído "
+                        f"({current_chunk_size / 1024 ** 2:.2f} MB, {lines_written} linhas) - "
+                        f"{lines_written / elapsed:.0f} linhas/s"
+                    )
+                    chunk_num += 1
+                    chunk_file = os.path.join(output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
+                    outfile = open(chunk_file, 'w', encoding='latin-1')
+                    outfile.write(header + "\n")
+                    current_chunk_size = 0
+                    lines_written = 0
 
-                    if current_chunk_size >= MAX_CHUNK_SIZE:
-                        outfile.close()
-                        elapsed = time.time() - start_time
-                        logger.info(
-                            f"{file_name}: chunk {chunk_num} concluído "
-                            f"({current_chunk_size / 1024 ** 2:.2f} MB, {lines_written} linhas) - "
-                            f"{lines_written / elapsed:.0f} linhas/s"
-                        )
-
-                        # Próximo chunk
-                        chunk_num += 1
-                        chunk_file = os.path.join(self.output_path, f"{base_name}_chunk_{chunk_num:03d}.csv")
-                        outfile = open(chunk_file, 'w', encoding='utf8')
-                        outfile.write(f"{header}\n")
-                        current_chunk_size = 0
-                        lines_written = 0
-
-            # Fechar último chunk se estiver aberto
             if not outfile.closed:
                 outfile.close()
                 elapsed = time.time() - start_time
@@ -86,18 +69,27 @@ class FileSplitter:
                     f"({current_chunk_size / 1024 ** 2:.2f} MB, {lines_written} linhas)"
                 )
 
-            logger.info(f"Divisão completa de {file_name} em {chunk_num} chunks")
-            return True
+        # Deletar arquivo original
+        os.remove(file_path)
+        logger.info(f"Arquivo original {file_name} removido após divisão")
 
-        except Exception as e:
-            logger.error(f"Erro ao dividir arquivo {file_name}", exception=e)
-            return False
+        return True
+
+    except Exception as e:
+        logger.error(f"Erro ao dividir arquivo {file_path}", exception=e)
+        return False
+
+
+class FileSplitter:
+    def __init__(self, input_path: str = None, output_path: str = None):
+        self.input_path = Path(input_path or EXTRACTED_FILES_PATH).absolute()
+        self.output_path = Path(output_path or TEMP_PATH).absolute()
+        self.output_path.mkdir(parents=True, exist_ok=True)
 
     def split_all_files(self) -> Tuple[Set[str], Set[str]]:
-        """Divide todos os arquivos do diretório de input, respeitando MAX_CHUNK_SIZE"""
         files_to_split = [
-            f for f in os.listdir(self.input_path)
-            if os.path.isfile(os.path.join(self.input_path, f)) and os.path.getsize(os.path.join(self.input_path, f)) > 0
+            f for f in self.input_path.iterdir()
+            if f.is_file() and f.stat().st_size > 0
         ]
 
         if not files_to_split:
@@ -108,28 +100,26 @@ class FileSplitter:
         failed = set()
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_file = {}
+            future_to_file = {
+                executor.submit(split_file_global, str(f), str(self.output_path), MAX_CHUNK_SIZE): f.name
+                for f in files_to_split if f.stat().st_size > MAX_CHUNK_SIZE
+            }
+
             for f in files_to_split:
-                file_path = os.path.join(self.input_path, f)
-                if os.path.getsize(file_path) <= MAX_CHUNK_SIZE:
-                    logger.info(f"Arquivo {f} menor que {MAX_CHUNK_SIZE_MB} MB, passando para próxima etapa")
-                    successful.add(f)
-                    continue
-                future_to_file[executor.submit(self.split_file_by_size, f)] = f
+                if f.stat().st_size <= MAX_CHUNK_SIZE:
+                    logger.info(f"Arquivo {f.name} menor que {MAX_CHUNK_SIZE_MB} MB, mantendo original")
+                    successful.add(f.name)
 
             for future in concurrent.futures.as_completed(future_to_file):
-                file = future_to_file[future]
+                file_name = future_to_file[future]
                 try:
                     if future.result():
-                        successful.add(file)
+                        successful.add(file_name)
                     else:
-                        failed.add(file)
+                        failed.add(file_name)
                 except Exception as e:
-                    logger.error(f"Erro no processamento de {file}", exception=e)
-                    failed.add(file)
-
-        if failed:
-            logger.warning(f"Falha na divisão de {len(failed)} arquivos: {', '.join(failed)}")
+                    logger.error(f"Erro no processamento de {file_name}", exception=e)
+                    failed.add(file_name)
 
         logger.info(f"Divisões concluídas: {len(successful)} sucesso, {len(failed)} falhas")
         return successful, failed
@@ -141,7 +131,6 @@ def run_splitter():
         splitter = FileSplitter()
         successful, failed = splitter.split_all_files()
         logger.end_timer("split_all_files", timer_start)
-
         return len(successful), len(failed)
     except Exception as e:
         logger.critical("Falha crítica no processo de divisão de arquivos", exception=e)

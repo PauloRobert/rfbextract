@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import glob
 import polars as pl
@@ -80,43 +81,43 @@ class DataLoader:
         # Schema para cada tipo de arquivo
         self.schemas = {
             'empresa': {
-                'cnpj_basico': pl.Utf8,
-                'razao_social': pl.Utf8,
+                'cnpj_basico': pl.latin-1,
+                'razao_social': pl.latin-1,
                 'natureza_juridica': pl.Int32,
                 'qualificacao_responsavel': pl.Int32,
                 'capital_social': pl.Float64,
                 'porte_empresa': pl.Int32,
-                'ente_federativo_responsavel': pl.Utf8
+                'ente_federativo_responsavel': pl.latin-1
             },
             'estabelecimento': {
-                'cnpj_basico': pl.Utf8, 'cnpj_ordem': pl.Utf8, 'cnpj_dv': pl.Utf8,
-                'identificador_matriz_filial': pl.Int32, 'nome_fantasia': pl.Utf8,
+                'cnpj_basico': pl.latin-1, 'cnpj_ordem': pl.latin-1, 'cnpj_dv': pl.latin-1,
+                'identificador_matriz_filial': pl.Int32, 'nome_fantasia': pl.latin-1,
                 'situacao_cadastral': pl.Int32, 'data_situacao_cadastral': pl.Int32,
-                'motivo_situacao_cadastral': pl.Int32, 'nome_cidade_exterior': pl.Utf8,
+                'motivo_situacao_cadastral': pl.Int32, 'nome_cidade_exterior': pl.latin-1,
                 'pais': pl.Int32, 'data_inicio_atividade': pl.Int32, 'cnae_fiscal_principal': pl.Int32,
-                'cnae_fiscal_secundaria': pl.Utf8, 'tipo_logradouro': pl.Utf8, 'logradouro': pl.Utf8,
-                'numero': pl.Utf8, 'complemento': pl.Utf8, 'bairro': pl.Utf8, 'cep': pl.Utf8,
-                'uf': pl.Utf8, 'municipio': pl.Int32, 'ddd_1': pl.Utf8, 'telefone_1': pl.Utf8,
-                'ddd_2': pl.Utf8, 'telefone_2': pl.Utf8, 'ddd_fax': pl.Utf8, 'fax': pl.Utf8,
-                'correio_eletronico': pl.Utf8, 'situacao_especial': pl.Utf8, 'data_situacao_especial': pl.Int32
+                'cnae_fiscal_secundaria': pl.latin-1, 'tipo_logradouro': pl.latin-1, 'logradouro': pl.latin-1,
+                'numero': pl.latin-1, 'complemento': pl.latin-1, 'bairro': pl.latin-1, 'cep': pl.latin-1,
+                'uf': pl.latin-1, 'municipio': pl.Int32, 'ddd_1': pl.latin-1, 'telefone_1': pl.latin-1,
+                'ddd_2': pl.latin-1, 'telefone_2': pl.latin-1, 'ddd_fax': pl.latin-1, 'fax': pl.latin-1,
+                'correio_eletronico': pl.latin-1, 'situacao_especial': pl.latin-1, 'data_situacao_especial': pl.Int32
             },
             'socios': {
-                'cnpj_basico': pl.Utf8, 'identificador_socio': pl.Int32, 'nome_socio_razao_social': pl.Utf8,
-                'cpf_cnpj_socio': pl.Utf8, 'qualificacao_socio': pl.Int32, 'data_entrada_sociedade': pl.Int32,
-                'pais': pl.Int32, 'representante_legal': pl.Utf8, 'nome_do_representante': pl.Utf8,
+                'cnpj_basico': pl.latin-1, 'identificador_socio': pl.Int32, 'nome_socio_razao_social': pl.latin-1,
+                'cpf_cnpj_socio': pl.latin-1, 'qualificacao_socio': pl.Int32, 'data_entrada_sociedade': pl.Int32,
+                'pais': pl.Int32, 'representante_legal': pl.latin-1, 'nome_do_representante': pl.latin-1,
                 'qualificacao_representante_legal': pl.Int32, 'faixa_etaria': pl.Int32
             },
             'simples': {
-                'cnpj_basico': pl.Utf8, 'opcao_pelo_simples': pl.Utf8, 'data_opcao_simples': pl.Int32,
-                'data_exclusao_simples': pl.Int32, 'opcao_mei': pl.Utf8, 'data_opcao_mei': pl.Int32,
+                'cnpj_basico': pl.latin-1, 'opcao_pelo_simples': pl.latin-1, 'data_opcao_simples': pl.Int32,
+                'data_exclusao_simples': pl.Int32, 'opcao_mei': pl.latin-1, 'data_opcao_mei': pl.Int32,
                 'data_exclusao_mei': pl.Int32
             },
-            'cnae': {'codigo': pl.Int32, 'descricao': pl.Utf8},
-            'moti': {'codigo': pl.Int32, 'descricao': pl.Utf8},
-            'munic': {'codigo': pl.Int32, 'descricao': pl.Utf8},
-            'natju': {'codigo': pl.Int32, 'descricao': pl.Utf8},
-            'pais': {'codigo': pl.Int32, 'descricao': pl.Utf8},
-            'quals': {'codigo': pl.Int32, 'descricao': pl.Utf8}
+            'cnae': {'codigo': pl.Int32, 'descricao': pl.latin-1},
+            'moti': {'codigo': pl.Int32, 'descricao': pl.latin-1},
+            'munic': {'codigo': pl.Int32, 'descricao': pl.latin-1},
+            'natju': {'codigo': pl.Int32, 'descricao': pl.latin-1},
+            'pais': {'codigo': pl.Int32, 'descricao': pl.latin-1},
+            'quals': {'codigo': pl.Int32, 'descricao': pl.latin-1}
         }
 
     def find_files_by_type(self, file_type: str) -> List[str]:
@@ -146,70 +147,47 @@ class DataLoader:
 
             start_time = time.time()
 
-            # Configurar leitura otimizada com Polars
-            df = pl.scan_csv(
+            # Ler o CSV sem cabeçalhos e definir os nomes das colunas usando column_map
+            df_lazy = pl.scan_csv(
                 file_path,
                 separator=';',
-                encoding='utf8',
-                has_header=True,
+                encoding='latin-1',
+                has_header=False,  # Arquivos não têm cabeçalhos
+                new_columns=list(column_map.values()),  # Usar os nomes das colunas do column_map
                 dtypes=schema,
-                low_memory=True,
-                row_count_name="row_count",
-                row_count_offset=1  # Comece a contar a partir da linha 1 (após o cabeçalho)
+                low_memory=True
             )
 
-            # Renomear colunas se necessário
-            if column_map and len(df.columns) == len(column_map):
-                # Se os nomes de colunas não forem os esperados, renomeie-os
-                df = df.rename({str(i): name for i, name in column_map.items()})
-
-            # Otimizações específicas por tipo de arquivo
-            if file_type == 'empresa':
-                # Tratamento específico para capital_social
-                df = df.with_columns(
-                    pl.col('capital_social').str.replace(',', '.').cast(pl.Float64)
-                )
-
-            # Executar o scan e materializar em chunks para controlar memória
             total_rows = 0
-
-            # Estimativa inicial do tamanho total
-            try:
-                file_size = os.path.getsize(file_path)
-                sample_df = pl.read_csv(file_path, separator=';', encoding='utf8', n_rows=1000)
-                avg_row_size = file_size / (len(sample_df) + 1)  # +1 para o cabeçalho
-                estimated_rows = int(file_size / avg_row_size)
-                logger.info(f"Tamanho estimado: {estimated_rows:,} linhas")
-            except:
-                estimated_rows = CHUNK_SIZE  # Valor padrão se não conseguir estimar
-
-            # Coletar os dataframes materializados em chunks
             with db_manager.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Processar em chunks para economizar memória
-                    for i, chunk_df in enumerate(df.collect(streaming=True)):
+                    for i, chunk_df in enumerate(df_lazy.collect(streaming=True)):
+                        if isinstance(chunk_df, pl.Series):
+                            chunk_df = chunk_df.to_frame()
+
+                        if file_type == 'empresa' and 'capital_social' in chunk_df.columns:
+                            chunk_df = chunk_df.with_columns(
+                                pl.col('capital_social').str.replace(',', '.').cast(pl.Float64)
+                            )
+
                         chunk_rows = len(chunk_df)
                         total_rows += chunk_rows
-
                         logger.info(f"Processando chunk {i+1} de {file_name}: {chunk_rows:,} linhas")
 
-                        # Converter para CSV em memória e usar COPY
-                        csv_data = chunk_df.write_csv(separator='\t', include_header=False)
+                        csv_buffer = io.StringIO()
+                        chunk_df.write_csv(csv_buffer, separator='\t', include_header=False)
+                        csv_buffer.seek(0)
 
-                        # Usar COPY para inserção eficiente
                         cursor.copy_from(
-                            file=csv_data.splitlines(),
+                            file=csv_buffer,
                             table=file_type,
                             sep='\t',
                             columns=chunk_df.columns
                         )
 
-                        # Calcular e mostrar progresso
-                        progress = min(100, (total_rows / estimated_rows) * 100)
                         elapsed = time.time() - start_time
                         speed = total_rows / elapsed if elapsed > 0 else 0
-
-                        logger.info(f"Progresso {file_name}: ~{progress:.1f}% - {total_rows:,} linhas - {speed:.0f} linhas/s")
+                        logger.info(f"Progresso {file_name}: {total_rows:,} linhas - {speed:.0f} linhas/s")
 
                     conn.commit()
 
@@ -221,6 +199,7 @@ class DataLoader:
         except Exception as e:
             logger.error(f"Erro ao processar arquivo {file_path}", exception=e)
             return False
+
 
     def load_file_type(self, file_type: str) -> Tuple[int, int]:
         files = self.find_files_by_type(file_type)
