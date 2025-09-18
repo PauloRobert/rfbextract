@@ -4,30 +4,31 @@ import re
 import glob
 import pandas as pd
 import concurrent.futures
-import time
-from pathlib import Path
 from typing import Dict, List, Tuple
-from dotenv import load_dotenv
-import chardet
 
 from utils.logging import logger
 from utils.db import db_manager
 
-# Carregar variáveis de ambiente
-load_dotenv()
-
-# Definir variáveis globais
+# Variáveis de ambiente (sem dependência de dotenv)
 EXTRACTED_FILES_PATH = os.getenv('EXTRACTED_FILES_PATH')
-TEMP_PATH = os.getenv('TEMP_PATH')
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 8))
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 1000000))
-COMPRESSION_LEVEL = int(os.getenv('COMPRESSION_LEVEL', 9))
+COMPRESSION_LEVEL = int(os.getenv('COMPRESSION_LEVEL', 9))  # mantido se usado por db_manager/schema
 
 
 class DataLoader:
     def __init__(self, input_path: str = None):
         self.input_path = input_path or EXTRACTED_FILES_PATH
-        self.temp_path = TEMP_PATH
+
+        if not self.input_path:
+            logger.critical("EXTRACTED_FILES_PATH não está definido no ambiente.")
+            raise ValueError("EXTRACTED_FILES_PATH não definido")
+
+        if not os.path.isdir(self.input_path):
+            logger.critical(f"Diretório EXTRACTED_FILES_PATH inválido ou inexistente: {self.input_path}")
+            raise ValueError(f"Diretório inválido: {self.input_path}")
+
+        # Padrões para mapeamento dos arquivos
         self.file_patterns = {
             'empresa': r'EMPRE',
             'estabelecimento': r'ESTABELE',
@@ -41,6 +42,7 @@ class DataLoader:
             'quals': r'QUALS'
         }
 
+        # Mapeamento de colunas (ordem exata usada no COPY)
         self.column_maps = {
             'empresa': {0: 'cnpj_basico', 1: 'razao_social', 2: 'natureza_juridica',
                         3: 'qualificacao_responsavel', 4: 'capital_social', 5: 'porte_empresa',
@@ -72,26 +74,33 @@ class DataLoader:
         }
 
     def find_files_by_type(self, file_type: str) -> List[str]:
+        """
+        Procura arquivos SOMENTE em EXTRACTED_FILES_PATH, conforme solicitado.
+        """
         pattern = self.file_patterns.get(file_type)
         if not pattern:
             logger.warning(f"Padrão não definido para o tipo de arquivo: {file_type}")
             return []
 
-        input_files = [f for f in glob.glob(os.path.join(self.input_path, '*'))
-                       if re.search(pattern, os.path.basename(f), re.IGNORECASE)]
-        temp_files = [f for f in glob.glob(os.path.join(self.temp_path, '*'))
-                      if re.search(pattern, os.path.basename(f), re.IGNORECASE)]
-        all_files = input_files + temp_files
-        logger.info(f"Encontrados {len(all_files)} arquivos do tipo {file_type}")
-        return all_files
+        files = [f for f in glob.glob(os.path.join(self.input_path, '*'))
+                 if re.search(pattern, os.path.basename(f), re.IGNORECASE)]
+        logger.info(f"Encontrados {len(files)} arquivos do tipo {file_type} em {self.input_path}")
+        return files
 
-    def detect_encoding(self, file_path: str, n_lines: int = 5000) -> str:
-        with open(file_path, 'rb') as f:
-            raw = b''.join([f.readline() for _ in range(n_lines)])
-        result = chardet.detect(raw)
-        encoding = result['encoding'] if result['encoding'] else 'utf-8'
-        logger.info(f"Encoding detectado para {os.path.basename(file_path)}: {encoding}")
-        return encoding
+    def detect_encoding(self, file_path: str) -> str:
+        """
+        Estratégia simples e robusta:
+        - Prioriza 'latin-1' (padrão dos arquivos da RFB).
+        - Se falhar ao validar alguns bytes, usa 'utf-8' como fallback.
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                _ = f.read(4096).decode('latin-1', errors='strict')
+            logger.info(f"Assumindo encoding 'latin-1' para {os.path.basename(file_path)}")
+            return 'latin-1'
+        except Exception:
+            logger.warning(f"Falha ao validar 'latin-1' em {os.path.basename(file_path)}; usando 'utf-8' como fallback.")
+            return 'utf-8'
 
     def process_file(self, file_path: str, file_type: str) -> bool:
         try:
@@ -99,49 +108,74 @@ class DataLoader:
             logger.info(f"Processando arquivo: {file_name}")
 
             column_map = self.column_maps.get(file_type, {})
+            expected_cols = list(column_map.values())
             total_rows = 0
             encoding = self.detect_encoding(file_path)
 
+            # Leitura em chunks com dtype=str (mais permissivo, semelhante ao to_sql do script simples)
             for chunk in pd.read_csv(
                     file_path,
                     sep=';',
-                    names=list(column_map.values()),
+                    names=expected_cols if expected_cols else None,
                     dtype=str,
                     chunksize=CHUNK_SIZE,
                     encoding=encoding,
-                    on_bad_lines='skip'
+                    on_bad_lines='skip',
+                    header=None,            # evita inferência de cabeçalho
+                    keep_default_na=False,  # não converte "NA"/"N/A" em NaN
+                    skip_blank_lines=True   # ignora linhas completamente vazias
             ):
-                # Verificar e remover linhas onde a primeira coluna ('codigo') é nula
-                initial_count = len(chunk)
+                # Determinar a coluna-chave (primeira coluna do mapeamento)
+                key_col = column_map.get(0) if 0 in column_map else (expected_cols[0] if expected_cols else None)
 
-                # A chave aqui é o `dropna`
-                # Ele remove as linhas onde a coluna 'codigo' é nula (NaN)
-                chunk.dropna(subset=['codigo'], inplace=True)
+                # Garantir que todas as colunas esperadas existam no chunk e na ordem do COPY
+                if expected_cols:
+                    for col in expected_cols:
+                        if col not in chunk.columns:
+                            chunk[col] = ""
+                    chunk = chunk[expected_cols]
 
-                rows_dropped = initial_count - len(chunk)
-                if rows_dropped > 0:
-                    logger.warning(
-                        f"Removidas {rows_dropped} linhas com valores nulos na coluna 'codigo' "
-                        f"do arquivo {file_name}."
-                    )
+                # Normalizar espaços
+                for col in expected_cols:
+                    chunk[col] = chunk[col].astype(str).str.strip()
+
+                # Remover possíveis cabeçalhos residuais e linhas sem chave
+                if key_col and key_col in chunk.columns:
+                    header_like = chunk[key_col].str.lower().isin({key_col.lower(), 'codigo', 'cnpj_basico'})
+                    if header_like.any():
+                        chunk = chunk[~header_like]
+
+                    before_clean = len(chunk)
+                    chunk = chunk[chunk[key_col].notna() & (chunk[key_col] != "")]
+                    dropped_key = before_clean - len(chunk)
+                    if dropped_key:
+                        logger.warning(f"Removidas {dropped_key} linhas sem chave em {file_name}")
 
                 if chunk.empty:
-                    logger.warning(f"O chunk ficou vazio após a limpeza. Continuando...")
+                    logger.warning(f"Chunk vazio após limpeza em {file_name}. Continuando...")
                     continue
 
-                # Corrigir capital_social para empresa
+                # Ajuste de capital_social (como no script simples)
                 if file_type == 'empresa' and 'capital_social' in chunk.columns:
-                    chunk['capital_social'] = chunk['capital_social'].str.replace(',', '.').astype(float)
+                    s = (
+                        chunk['capital_social']
+                        .astype(str)
+                        .str.strip()
+                        .str.replace('.', '', regex=False)   # remove separador de milhar
+                        .str.replace(',', '.', regex=False)  # converte decimal
+                    )
+                    chunk['capital_social'] = pd.to_numeric(s, errors='coerce').fillna(0.0)
 
                 total_rows += len(chunk)
 
-                # Inserir no banco
+                # Inserção com COPY (rápido e consistente)
                 with db_manager.get_connection() as conn:
                     with conn.cursor() as cursor:
                         buffer = io.StringIO()
-                        chunk.to_csv(buffer, sep='\t', index=False, header=False)
+                        cols_for_copy = expected_cols if expected_cols else list(chunk.columns)
+                        chunk[cols_for_copy].to_csv(buffer, sep='\t', index=False, header=False)
                         buffer.seek(0)
-                        cursor.copy_from(buffer, file_type, sep='\t', columns=chunk.columns)
+                        cursor.copy_from(buffer, file_type, sep='\t', columns=cols_for_copy)
                     conn.commit()
 
             logger.info(f"Arquivo {file_name} processado: {total_rows:,} linhas")
@@ -160,6 +194,7 @@ class DataLoader:
         successful, failed = 0, 0
         db_manager.recreate_table(file_type)
 
+        # Processamento paralelo por arquivo
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_file = {executor.submit(self.process_file, f, file_type): f for f in files}
             for future in concurrent.futures.as_completed(future_to_file):
@@ -186,10 +221,12 @@ class DataLoader:
     def load_all_data(self) -> Dict[str, Tuple[int, int]]:
         result = {}
         db_manager.initialize_database(recreate=True)
+
         processing_order = [
             'cnae', 'moti', 'munic', 'natju', 'pais', 'quals',
             'empresa', 'simples', 'socios', 'estabelecimento'
         ]
+
         for file_type in processing_order:
             start_time = logger.start_timer(f"load_{file_type}")
             try:
@@ -198,6 +235,7 @@ class DataLoader:
                 logger.error(f"Falha ao carregar dados do tipo {file_type}", exception=e)
                 result[file_type] = (0, 0)
             logger.end_timer(f"load_{file_type}", start_time)
+
         return result
 
 
@@ -213,7 +251,6 @@ def run_loader():
 
         logger.info(f"Carga de dados concluída: {total_success} sucessos, {total_fail} falhas")
 
-        # Só gerar warning se houver falhas reais
         if total_fail > 0 and total_success == 0:
             logger.warning("Carregamento concluído, mas sem arquivos processados")
         elif total_fail > 0:
