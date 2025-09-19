@@ -1,310 +1,306 @@
 import os
 import sys
-import pathlib
 import re
 import time
 import gc
-import io
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-import requests
-from bs4 import BeautifulSoup
+import pathlib
 import zipfile
-import shutil
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import psycopg2
-from psycopg2 import sql
+import requests
+import wget
+import bs4 as bs
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
 
-# ---------------------------
-# Config & util
-# ---------------------------
-current_path = pathlib.Path().resolve()
-# Look for .env inside a utils folder relative to project root
-dotenv_path_candidate = current_path.joinpath('../utils', '.env')
-if not dotenv_path_candidate.exists():
-    dotenv_path_candidate = current_path.joinpath('.env')
-    if not dotenv_path_candidate.exists():
-        raise FileNotFoundError('Arquivo .env não encontrado em ./utils nem na raiz do projeto. Coloque o .env em utils/.env')
+class RfbEtl:
+    def __init__(self):
+        current_path = pathlib.Path().resolve()
+        dotenv_path = os.path.join(current_path, '../utils', '.env')
+        if not os.path.isfile(dotenv_path):
+            raise FileNotFoundError("Arquivo .env não encontrado em utils/")
+        load_dotenv(dotenv_path=dotenv_path)
 
-load_dotenv(dotenv_path=str(dotenv_path_candidate))
+        # Diretórios
+        self.output_files = os.getenv("OUTPUT_FILES_PATH")
+        self.extracted_files = os.getenv("EXTRACTED_FILES_PATH")
+        self.rf_data_url = os.getenv("RF_DATA_URL")
 
-# Read paths and urls from env (mandatory)
-OUTPUT_FILES_PATH = os.getenv('OUTPUT_FILES_PATH')
-EXTRACTED_FILES_PATH = os.getenv('EXTRACTED_FILES_PATH')
-RF_DATA_URL = os.getenv('RF_DATA_URL')
+        self.makedirs(self.output_files)
+        self.makedirs(self.extracted_files)
 
-if not OUTPUT_FILES_PATH or not EXTRACTED_FILES_PATH or not RF_DATA_URL:
-    raise EnvironmentError('Variáveis OUTPUT_FILES_PATH, EXTRACTED_FILES_PATH e RF_DATA_URL devem existir no .env')
+        # Banco
+        self.db_user = os.getenv("DB_USER")
+        self.db_pass = os.getenv("DB_PASSWORD")
+        self.db_host = os.getenv("DB_HOST")
+        self.db_port = os.getenv("DB_PORT")
+        self.db_name = os.getenv("DB_NAME")
 
-os.makedirs(OUTPUT_FILES_PATH, exist_ok=True)
-os.makedirs(EXTRACTED_FILES_PATH, exist_ok=True)
+        try:
+            self.engine = create_engine(
+                f"postgresql://{self.db_user}:{self.db_pass}@{self.db_host}:{self.db_port}/{self.db_name}"
+            )
+            self.conn = psycopg2.connect(
+                dbname=self.db_name,
+                user=self.db_user,
+                host=self.db_host,
+                port=self.db_port,
+                password=self.db_pass
+            )
+            self.cur = self.conn.cursor()
+            print(f"Conectado com sucesso ao banco: {self.db_name}@{self.db_host}:{self.db_port}")
+        except Exception as e:
+            print(f"Erro ao conectar no banco de dados: {e}")
+            sys.exit(1)
 
-print(f'OUTPUT_FILES_PATH={OUTPUT_FILES_PATH}\nEXTRACTED_FILES_PATH={EXTRACTED_FILES_PATH}\nRF_DATA_URL={RF_DATA_URL}')
+    @staticmethod
+    def makedirs(path):
+        if not os.path.exists(path):
+            os.makedirs(path)
 
-# DB settings from env
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = os.getenv('DB_PASSWORD')
-DB_HOST = os.getenv('DB_HOST')
-DB_PORT = os.getenv('DB_PORT')
-DB_NAME = os.getenv('DB_NAME')
-
-if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
-    raise EnvironmentError('Variáveis de conexão com o BD não encontradas no .env')
-
-# Create sqlalchemy engine
-engine = create_engine(f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}',
-                       pool_size=5, max_overflow=10)
-
-# A small helper to stream-download a file using requests and write it to disk in chunks
-def download_file(url: str, dest_path: str):
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get('content-length', 0))
-        with open(dest_path, 'wb') as f:
-            downloaded = 0
-            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        pct = downloaded * 100 / total
-                        sys.stdout.write(f'\r{os.path.basename(dest_path)} {pct:.2f}% ({downloaded}/{total})')
-                        sys.stdout.flush()
-    print('\n')
-
-# ---------------------------
-# Discover files on RF index page
-# ---------------------------
-print('Buscando lista de arquivos em', RF_DATA_URL)
-resp = requests.get(RF_DATA_URL, timeout=30)
-resp.raise_for_status()
-page = BeautifulSoup(resp.content, 'lxml')
-links = [a.get('href') for a in page.find_all('a', href=True) if a.get('href').lower().endswith('.zip')]
-# Normalize links that might be relative
-Files = []
-for l in links:
-    if l.startswith('http'):
-        Files.append(l)
-    else:
-        Files.append(os.path.join(RF_DATA_URL, l))
-
-print(f'Foram encontrados {len(Files)} arquivos .zip')
-for i, f in enumerate(Files, 1):
-    print(f'{i} - {f}')
-
-# ---------------------------
-# Download files (only if changed or missing)
-# ---------------------------
-
-def needs_download(url: str, local_path: str) -> bool:
-    if not os.path.exists(local_path):
-        return True
-    try:
-        head = requests.head(url, timeout=20)
-        head.raise_for_status()
-        remote_size = int(head.headers.get('content-length', 0))
-        local_size = os.path.getsize(local_path)
-        return remote_size != local_size
-    except Exception:
-        # If HEAD fails, fallback to not re-downloading
+    @staticmethod
+    def check_diff(url, file_name):
+        if not os.path.isfile(file_name):
+            return True
+        response = requests.head(url)
+        new_size = int(response.headers.get('content-length', 0))
+        old_size = os.path.getsize(file_name)
+        if new_size != old_size:
+            os.remove(file_name)
+            return True
         return False
 
-for remote_url in Files:
-    fname = os.path.basename(remote_url)
-    dest = os.path.join(OUTPUT_FILES_PATH, fname)
-    if needs_download(remote_url, dest):
-        print('Baixando:', remote_url)
-        download_file(remote_url, dest)
-    else:
-        print('Já existe e parece igual, pulando:', fname)
+    def list_files(self):
+        raw_html = urllib.request.urlopen(self.rf_data_url).read()
+        page_items = bs.BeautifulSoup(raw_html, 'lxml')
+        html_str = str(page_items)
 
-# ---------------------------
-# Extract and remove zips to free disk space
-# ---------------------------
-print('Descompactando arquivos...')
-for file in os.listdir(OUTPUT_FILES_PATH):
-    if file.lower().endswith('.zip'):
-        full = os.path.join(OUTPUT_FILES_PATH, file)
+        files = []
+        for m in re.finditer('.zip', html_str):
+            i_start = m.start() - 40
+            i_end = m.end()
+            i_loc = html_str[i_start:i_end].find('href=') + 6
+            files.append(html_str[i_start + i_loc:i_end])
+
+        files_clean = [f for f in files if not f.find('.zip">') > -1]
+        return files_clean
+
+    def download_file(self, url):
+        file_name = os.path.join(self.output_files, os.path.basename(url))
+        if self.check_diff(url, file_name):
+            print(f"Baixando {file_name}...")
+            wget.download(url, out=self.output_files)
+        else:
+            print(f"Já existe e está atualizado: {file_name}")
+        return file_name
+
+    def download_files(self, max_workers=2):
+        files = self.list_files()
+        urls = [self.rf_data_url + f for f in files]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(self.download_file, url) for url in urls]
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    print(f"\n✔ Finalizado: {result}")
+                except Exception as e:
+                    print(f"\n❌ Erro no download: {e}")
+
+    def extract_files(self):
+        files = [f for f in os.listdir(self.output_files) if f.endswith(".zip")]
+        for i, f in enumerate(files, 1):
+            print(f"Extraindo {i}/{len(files)}: {f}")
+            full_path = os.path.join(self.output_files, f)
+            try:
+                with zipfile.ZipFile(full_path, 'r') as zip_ref:
+                    zip_ref.extractall(self.extracted_files)
+                os.remove(full_path)
+            except Exception as e:
+                print(f"Erro ao extrair {f}: {e}")
+
+        print("Arquivos presentes em EXTRACTED_FILES_PATH:")
+        for f in os.listdir(self.extracted_files):
+            print(f" - {f}")
+
+    def to_sql(self, dataframe, **kwargs):
         try:
-            with zipfile.ZipFile(full, 'r') as z:
-                z.extractall(EXTRACTED_FILES_PATH)
-            print('Extraído:', file)
-            # Remove zip to free space
-            os.remove(full)
-            print('Removido zip:', file)
+            dataframe.to_sql(**kwargs, method='multi', chunksize=10000)
         except Exception as e:
-            print('Falha ao extrair', file, e)
+            print(f"Erro ao inserir {kwargs.get('name')}: {e}")
+            print("Tentando inserir sem method='multi'...")
+            try:
+                dataframe.to_sql(**kwargs)
+            except Exception as e2:
+                print(f"Falha completa na inserção: {e2}")
 
-# ---------------------------
-# Utility: optimized to_sql using chunks and method='multi'
-# ---------------------------
+    def _match_files(self, substr_list):
+        files = os.listdir(self.extracted_files)
+        matched = []
+        for f in files:
+            for sub in substr_list:
+                if sub.lower() in f.lower():
+                    matched.append(f)
+                    break
+        return matched
 
-def insert_dataframe(df: pd.DataFrame, table_name: str, engine, if_exists='append', chunksize=5000):
-    """Insert dataframe into Postgres using pandas.to_sql with method='multi' and explicit chunksize.
-       Converts object columns with low cardinality to category to reduce memory while in pandas.
-    """
-    # Reduce memory: convert object columns with low cardinality to category (helps pandas memory)
-    for col in df.select_dtypes(include=['object']).columns:
-        if df[col].nunique(dropna=False) / max(1, len(df)) < 0.5:
-            df[col] = df[col].astype('category')
+    def _insert_df(self, file_path, table_name, columns_expected=None, chunksize=500000):
+        print(f"-> Iniciando carga de {file_path} em {table_name}...")
 
-    df.to_sql(name=table_name, con=engine, if_exists=if_exists, index=False, method='multi', chunksize=chunksize)
+        # Conta total de linhas do arquivo
+        total_rows = sum(1 for _ in open(file_path, encoding='latin-1'))
+        inserted_rows = 0
+        chunk_num = 0
+        start_time = time.time()
 
-# ---------------------------
-# Map extracted filenames to logical groups (the original script logic)
-# ---------------------------
-items = [f for f in os.listdir(EXTRACTED_FILES_PATH)]
-arquivos = {
-    'empresa': [f for f in items if 'EMPRE' in f],
-    'estabelecimento': [f for f in items if 'ESTABELE' in f],
-    'socios': [f for f in items if 'SOCIO' in f],
-    'simples': [f for f in items if 'SIMPLES' in f],
-    'cnae': [f for f in items if 'CNAE' in f],
-    'moti': [f for f in items if 'MOTI' in f],
-    'munic': [f for f in items if 'MUNIC' in f],
-    'natju': [f for f in items if 'NATJU' in f],
-    'pais': [f for f in items if 'PAIS' in f],
-    'quals': [f for f in items if 'QUALS' in f],
-}
+        for chunk in pd.read_csv(
+            file_path,
+            sep=';',
+            header=None,
+            encoding='latin-1',
+            dtype=str,
+            chunksize=chunksize
+        ):
+            chunk_num += 1
+            if columns_expected and len(chunk.columns) == len(columns_expected):
+                chunk.columns = columns_expected
 
-# ---------------------------
-# DB connection helper for COPY (faster loads) - simple fallback using to_sql when needed
-# ---------------------------
+            # Inserindo chunk no banco
+            self.to_sql(chunk, name=table_name, con=self.engine, if_exists='append', index=False)
 
-def get_psycopg_conn():
-    return psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+            inserted_rows += len(chunk)
+            percent = (inserted_rows / total_rows) * 100
 
-# We'll use a combination: for very large files use chunked read_csv + to_sql; for small ones just full read
+            # Cálculo de ETA
+            elapsed = time.time() - start_time
+            rows_per_sec = inserted_rows / elapsed if elapsed > 0 else 0
+            eta = (total_rows - inserted_rows) / rows_per_sec if rows_per_sec > 0 else 0
 
-# Example: empresa (smaller-ish) - keep original columns mapping but use chunking
-if arquivos['empresa']:
-    print('\n### Processando arquivos EMPRESA ###')
-    with get_psycopg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('DROP TABLE IF EXISTS empresa;')
-        conn.commit()
+            # Impressão do progresso
+            print(f"[{table_name}] Chunk {chunk_num} -> {inserted_rows:,}/{total_rows:,} "
+                f"linhas ({percent:.2f}%) - ETA {eta/60:.1f} min")
 
-    for f in arquivos['empresa']:
-        path = os.path.join(EXTRACTED_FILES_PATH, f)
-        dtypes = {0: 'object', 1: 'object', 2: 'Int64', 3: 'Int64', 4: 'object', 5: 'Int64', 6: 'object'}
-        # read in chunks
-        reader = pd.read_csv(path, sep=';', header=None, dtype=dtypes, encoding='latin-1', chunksize=100000)
-        first = True
-        for chunk in reader:
-            chunk.reset_index(drop=True, inplace=True)
-            chunk.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 'qualificacao_responsavel', 'capital_social', 'porte_empresa', 'ente_federativo_responsavel']
-            # convert capital_social
-            chunk['capital_social'] = chunk['capital_social'].astype(str).str.replace(',', '.').replace('nan', None)
-            chunk['capital_social'] = pd.to_numeric(chunk['capital_social'], errors='coerce')
-            insert_dataframe(chunk, 'empresa', engine, if_exists='append', chunksize=5000)
-            del chunk
-            gc.collect()
-        print('Concluído:', f)
+        print(f"✅ Finalizado {table_name}: {total_rows:,} linhas inseridas "
+            f"em {elapsed/60:.1f} min")
 
-# estabelecimento: muito grande -> chunked processing already present in original; we use chunksize iterator and to_sql with method='multi'
-if arquivos['estabelecimento']:
-    print('\n### Processando arquivos ESTABELECIMENTO ###')
-    with get_psycopg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('DROP TABLE IF EXISTS estabelecimento;')
-        conn.commit()
+            # Conta total de linhas do arquivo antes (para calcular %)
+        total_rows = sum(1 for _ in open(file_path, encoding='latin-1')) - 1  # menos header
+        inserted_rows = 0
 
-    for f in arquivos['estabelecimento']:
-        path = os.path.join(EXTRACTED_FILES_PATH, f)
-        dtypes = {0: 'object', 1: 'object', 2: 'object', 3: 'Int64', 4: 'object', 5: 'Int64', 6: 'Int64',
-                  7: 'Int64', 8: 'object', 9: 'object', 10: 'Int64', 11: 'Int64', 12: 'object', 13: 'object',
-                  14: 'object', 15: 'object', 16: 'object', 17: 'object', 18: 'object', 19: 'object',
-                  20: 'Int64', 21: 'object', 22: 'object', 23: 'object', 24: 'object', 25: 'object',
-                  26: 'object', 27: 'object', 28: 'object', 29: 'Int64'}
-        reader = pd.read_csv(path, sep=';', header=None, dtype=dtypes, encoding='latin-1', chunksize=200000)
-        for i, chunk in enumerate(reader):
-            chunk.reset_index(drop=True, inplace=True)
-            chunk.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial', 'nome_fantasia',
-                             'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral', 'nome_cidade_exterior',
-                             'pais', 'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria', 'tipo_logradouro',
-                             'logradouro', 'numero', 'complemento', 'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1',
-                             'ddd_2', 'telefone_2', 'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
-            insert_dataframe(chunk, 'estabelecimento', engine, if_exists='append', chunksize=5000)
-            print(f'Inserido chunk {i} do arquivo {f}')
-            del chunk
-            gc.collect()
-        print('Concluído:', f)
+        # Leitura em chunks
+        for chunk in pd.read_csv(
+            file_path, 
+            sep=';', 
+            header=None, 
+            encoding='latin-1', 
+            dtype=str, 
+            chunksize=chunksize
+        ):
+            if columns_expected and len(chunk.columns) == len(columns_expected):
+                chunk.columns = columns_expected
 
-# socios
-if arquivos['socios']:
-    print('\n### Processando arquivos SOCIOS ###')
-    with get_psycopg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('DROP TABLE IF EXISTS socios;')
-        conn.commit()
+            self.to_sql(chunk, name=table_name, con=self.engine, if_exists='append', index=False)
 
-    for f in arquivos['socios']:
-        path = os.path.join(EXTRACTED_FILES_PATH, f)
-        dtypes = {0: 'object', 1: 'Int64', 2: 'object', 3: 'object', 4: 'Int64', 5: 'Int64', 6: 'Int64',
-                  7: 'object', 8: 'object', 9: 'Int64', 10: 'Int64'}
-        reader = pd.read_csv(path, sep=';', header=None, dtype=dtypes, encoding='latin-1', chunksize=200000)
-        for chunk in reader:
-            chunk.reset_index(drop=True, inplace=True)
-            chunk.columns = ['cnpj_basico', 'identificador_socio', 'nome_socio_razao_social', 'cpf_cnpj_socio',
-                             'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
-                             'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
-            insert_dataframe(chunk, 'socios', engine, if_exists='append', chunksize=5000)
-            del chunk
-            gc.collect()
-        print('Concluído:', f)
+            inserted_rows += len(chunk)
 
-# simples (split/partitions) - read in chunks
-if arquivos['simples']:
-    print('\n### Processando arquivos SIMPLES ###')
-    with get_psycopg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('DROP TABLE IF EXISTS simples;')
-        conn.commit()
+            # Conta no banco para garantir
+            self.cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+            db_count = self.cur.fetchone()[0]
 
-    for f in arquivos['simples']:
-        path = os.path.join(EXTRACTED_FILES_PATH, f)
-        # We will iterate by chunks instead of counting lines upfront (more memory friendly)
-        dtypes = {0: 'object', 1: 'object', 2: 'Int64', 3: 'Int64', 4: 'object', 5: 'Int64', 6: 'Int64'}
-        reader = pd.read_csv(path, sep=';', header=None, dtype=dtypes, encoding='latin-1', chunksize=500000)
-        for i, chunk in enumerate(reader):
-            chunk.reset_index(drop=True, inplace=True)
-            chunk.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples', 'data_exclusao_simples',
-                             'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
-            insert_dataframe(chunk, 'simples', engine, if_exists='append', chunksize=5000)
-            print(f'Inserido chunk {i} do arquivo {f}')
-            del chunk
-            gc.collect()
-        print('Concluído:', f)
+            percent = (db_count / total_rows) * 100
+            print(f"[{table_name}] {db_count}/{total_rows} linhas ({percent:.2f}%)")
 
-# The smaller lookup tables (cnae, moti, munic, natju, pais, quals) can be read fully and inserted
-for tbl in ['cnae', 'moti', 'munic', 'natju', 'pais', 'quals']:
-    files = arquivos.get(tbl) or []
-    if not files:
-        continue
-    print(f'\n### Processando {tbl.upper()} ###')
-    with get_psycopg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(tbl)))
-        conn.commit()
+        print(f"✅ Finalizado {table_name} - {total_rows} linhas inseridas.")
 
-    for f in files:
-        path = os.path.join(EXTRACTED_FILES_PATH, f)
-        df = pd.read_csv(path, sep=';', header=None, dtype='object', encoding='latin-1')
-        df.reset_index(drop=True, inplace=True)
-        df.columns = ['codigo', 'descricao']
-        insert_dataframe(df, tbl, engine, if_exists='append', chunksize=5000)
-        del df
-        gc.collect()
-        print('Concluído:', f)
+    
 
-# ---------------------------
-# Create indexes (if not exists)
-# ---------------------------
-print('\nCriando índices...')
-with engine.begin() as conn:
-    conn.execute(text('create index if not exists empresa_cnpj on empresa(cnpj_basico);'))
-    conn.execute(text('create index if not exists estabelecimento_cnpj on estabelecimento(cnpj_basico);'))
-    conn.execute(text('create index if not exists socios_cnpj on socios(cnpj_basico);'))
-    conn.execute(text('create index if not exists simples_cnpj on simples(cnpj_basico);'))
+    def load_data(self, drop_tables=True):
+        start = time.time()
 
-print('Processo finalizado!')
+        file_categories = {
+            "estabelecimento": ['ESTABELE'],
+            "empresa": ['EMPRE'],
+            "socios": ['SOCIO'],
+            "simples": ['SIMPLES'],
+            "cnae": ['CNAE'],
+            "moti": ['MOTI'],
+            "munic": ['MUNIC'],
+            "natju": ['NATJU'],
+            "pais": ['PAIS'],
+            "quals": ['QUALS']
+        }
+
+        expected_columns = {
+            "estabelecimento": [
+                'cnpj_basico','cnpj_ordem','cnpj_dv','identificador_matriz_filial',
+                'nome_fantasia','situacao_cadastral','data_situacao_cadastral','motivo_situacao_cadastral',
+                'nome_cidade_exterior','pais','data_inicio_atividade','cnae_fiscal_principal','cnae_fiscal_secundaria',
+                'tipo_logradouro','logradouro','numero','complemento','bairro','cep','uf','municipio',
+                'ddd1','telefone1','ddd2','telefone2','ddd_fax','fax','correio_eletronico','situacao_especial','data_situacao_especial'
+            ],
+            "empresa": ['cnpj_basico','razao_social','natureza_juridica','qualificacao_responsavel','capital_social','porte','ente_federativo'],
+            "socios": ['cnpj_basico','identificador_socio','nome_socio','cnpj_cpf_socio','qualificacao_socio','data_entrada_sociedade',
+                       'pais','representante_legal','nome_representante','qualificacao_representante','faixa_etaria'],
+            "simples": ['cnpj_basico','opcao_simples','data_opcao_simples','data_exclusao_simples','opcao_mei','data_opcao_mei','data_exclusao_mei'],
+            "cnae": ['codigo','descricao'],
+            "moti": ['codigo','descricao'],
+            "munic": ['codigo','descricao'],
+            "natju": ['codigo','descricao'],
+            "pais": ['codigo','descricao'],
+            "quals": ['codigo','descricao']
+        }
+
+        for table, substr_list in file_categories.items():
+            if drop_tables:
+                print(f"Dropping table {table} se existir...")
+                try:
+                    self.cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
+                    self.conn.commit()
+                except Exception as e:
+                    print(f"Erro ao dropar {table}: {e}")
+
+            matched_files = self._match_files(substr_list)
+            if not matched_files:
+                print(f"Nenhum arquivo encontrado para {table}, pulando...")
+                continue
+            print(f"Carregando {table} ({len(matched_files)} arquivo(s))...")
+            for file in matched_files:
+                path = os.path.join(self.extracted_files, file)
+                self._insert_df(path, table_name=table, columns_expected=expected_columns.get(table))
+
+        end = time.time()
+        print(f"Carga concluída em {round((end-start)/60, 2)} minutos")
+
+    def create_indexes(self):
+        self.cur.execute("""
+        create index if not exists empresa_cnpj on empresa(cnpj_basico);
+        create index if not exists estabelecimento_cnpj on estabelecimento(cnpj_basico);
+        create index if not exists socios_cnpj on socios(cnpj_basico);
+        create index if not exists simples_cnpj on simples(cnpj_basico);
+        """)
+        self.conn.commit()
+        print("Índices criados!")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="ETL RFB")
+    parser.add_argument("--download", action="store_true")
+    parser.add_argument("--extract", action="store_true")
+    parser.add_argument("--load", action="store_true")
+    parser.add_argument("--index", action="store_true")
+    args = parser.parse_args()
+
+    etl = RfbEtl()
+
+    if args.download:
+        etl.download_files()
+    if args.extract:
+        etl.extract_files()
+    if args.load:
+        etl.load_data()
+    if args.index:
+        etl.create_indexes()
