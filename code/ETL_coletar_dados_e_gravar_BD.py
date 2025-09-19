@@ -128,7 +128,7 @@ class RfbEtl:
 
     def to_sql(self, dataframe, **kwargs):
         try:
-            dataframe.to_sql(**kwargs, method='multi', chunksize=10000)
+            dataframe.to_sql(**kwargs, method='multi', chunksize=500000)
         except Exception as e:
             print(f"Erro ao inserir {kwargs.get('name')}: {e}")
             print("Tentando inserir sem method='multi'...")
