@@ -2,7 +2,6 @@ import os
 import sys
 import re
 import time
-import gc
 import pathlib
 import zipfile
 import urllib.request
@@ -15,6 +14,7 @@ import wget
 import bs4 as bs
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
+
 
 class RfbEtl:
     def __init__(self):
@@ -136,6 +136,38 @@ class RfbEtl:
                 dataframe.to_sql(**kwargs)
             except Exception as e2:
                 print(f"Falha completa na inserção: {e2}")
+                raise e2
+
+    def _init_state_table(self):
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS etl_processed_files (
+            file_name TEXT PRIMARY KEY,
+            table_name TEXT,
+            processed_at TIMESTAMP,
+            status TEXT,
+            rows_inserted BIGINT DEFAULT 0,
+            error TEXT
+        );
+        """)
+        self.conn.commit()
+
+    def is_processed(self, file_name):
+        self.cur.execute("SELECT status FROM etl_processed_files WHERE file_name = %s;", (file_name,))
+        row = self.cur.fetchone()
+        return bool(row and row[0] == 'done')
+
+    def mark_processed(self, file_name, table_name, rows_inserted=0, status='done', error=None):
+        self.cur.execute("""
+            INSERT INTO etl_processed_files(file_name, table_name, processed_at, status, rows_inserted, error)
+            VALUES (%s, %s, NOW(), %s, %s, %s)
+            ON CONFLICT (file_name) DO UPDATE
+            SET table_name = EXCLUDED.table_name,
+                processed_at = EXCLUDED.processed_at,
+                status = EXCLUDED.status,
+                rows_inserted = EXCLUDED.rows_inserted,
+                error = EXCLUDED.error;
+        """, (file_name, table_name, status, rows_inserted, error))
+        self.conn.commit()
 
     def _match_files(self, substr_list):
         files = os.listdir(self.extracted_files)
@@ -147,10 +179,7 @@ class RfbEtl:
                     break
         return matched
 
-    def _insert_df(self, file_path, table_name, columns_expected=None, chunksize=500000):
-        print(f"-> Iniciando carga de {file_path} em {table_name}...")
-
-        # Conta total de linhas do arquivo
+    def _insert_df(self, file_path, table_name, columns_expected=None, chunksize=1_000_000):
         total_rows = sum(1 for _ in open(file_path, encoding='latin-1'))
         inserted_rows = 0
         chunk_num = 0
@@ -168,57 +197,25 @@ class RfbEtl:
             if columns_expected and len(chunk.columns) == len(columns_expected):
                 chunk.columns = columns_expected
 
-            # Inserindo chunk no banco
             self.to_sql(chunk, name=table_name, con=self.engine, if_exists='append', index=False)
 
             inserted_rows += len(chunk)
-            percent = (inserted_rows / total_rows) * 100
 
-            # Cálculo de ETA
             elapsed = time.time() - start_time
             rows_per_sec = inserted_rows / elapsed if elapsed > 0 else 0
             eta = (total_rows - inserted_rows) / rows_per_sec if rows_per_sec > 0 else 0
 
-            # Impressão do progresso
+            percent = (inserted_rows / total_rows) * 100 if total_rows else 0
             print(f"[{table_name}] Chunk {chunk_num} -> {inserted_rows:,}/{total_rows:,} "
-                f"linhas ({percent:.2f}%) - ETA {eta/60:.1f} min")
+                  f"linhas ({percent:.2f}%) - ETA {eta/60:.1f} min")
 
-        print(f"✅ Finalizado {table_name}: {total_rows:,} linhas inseridas "
-            f"em {elapsed/60:.1f} min")
+        elapsed_total = time.time() - start_time
+        print(f"✅ Finalizado {table_name} - {inserted_rows:,}/{total_rows:,} em {elapsed_total/60:.1f} min")
+        return inserted_rows
 
-            # Conta total de linhas do arquivo antes (para calcular %)
-        total_rows = sum(1 for _ in open(file_path, encoding='latin-1')) - 1  # menos header
-        inserted_rows = 0
-
-        # Leitura em chunks
-        for chunk in pd.read_csv(
-            file_path, 
-            sep=';', 
-            header=None, 
-            encoding='latin-1', 
-            dtype=str, 
-            chunksize=chunksize
-        ):
-            if columns_expected and len(chunk.columns) == len(columns_expected):
-                chunk.columns = columns_expected
-
-            self.to_sql(chunk, name=table_name, con=self.engine, if_exists='append', index=False)
-
-            inserted_rows += len(chunk)
-
-            # Conta no banco para garantir
-            self.cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-            db_count = self.cur.fetchone()[0]
-
-            percent = (db_count / total_rows) * 100
-            print(f"[{table_name}] {db_count}/{total_rows} linhas ({percent:.2f}%)")
-
-        print(f"✅ Finalizado {table_name} - {total_rows} linhas inseridas.")
-
-    
-
-    def load_data(self, drop_tables=True):
+    def load_data(self, drop_tables=False, resume=True, force=False):
         start = time.time()
+        self._init_state_table()
 
         file_categories = {
             "estabelecimento": ['ESTABELE'],
@@ -255,7 +252,7 @@ class RfbEtl:
 
         for table, substr_list in file_categories.items():
             if drop_tables:
-                print(f"Dropping table {table} se existir...")
+                print(f"Dropping table {table} se existir (opção --drop ativada)...")
                 try:
                     self.cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
                     self.conn.commit()
@@ -266,10 +263,26 @@ class RfbEtl:
             if not matched_files:
                 print(f"Nenhum arquivo encontrado para {table}, pulando...")
                 continue
+
             print(f"Carregando {table} ({len(matched_files)} arquivo(s))...")
+
             for file in matched_files:
+                if resume and not force and self.is_processed(file):
+                    print(f"Pulando {file} (já processado). Use --force para reprocessar.")
+                    continue
+
                 path = os.path.join(self.extracted_files, file)
-                self._insert_df(path, table_name=table, columns_expected=expected_columns.get(table))
+                print(f"Iniciando arquivo {file} -> tabela {table}")
+                try:
+                    rows_inserted = self._insert_df(path, table_name=table, columns_expected=expected_columns.get(table))
+                    self.mark_processed(file_name=file, table_name=table, rows_inserted=rows_inserted, status='done', error=None)
+                except Exception as e:
+                    print(f"❌ Erro processando {file}: {e}")
+                    try:
+                        self.mark_processed(file_name=file, table_name=table, rows_inserted=0, status='failed', error=str(e))
+                    except Exception:
+                        pass
+                    continue
 
         end = time.time()
         print(f"Carga concluída em {round((end-start)/60, 2)} minutos")
@@ -292,6 +305,8 @@ if __name__ == "__main__":
     parser.add_argument("--extract", action="store_true")
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--index", action="store_true")
+    parser.add_argument("--drop", action="store_true", help="Dropar tabelas antes de carregar (use com cuidado)")
+    parser.add_argument("--force", action="store_true", help="Forçar reprocessamento de arquivos já processados")
     args = parser.parse_args()
 
     etl = RfbEtl()
@@ -301,6 +316,6 @@ if __name__ == "__main__":
     if args.extract:
         etl.extract_files()
     if args.load:
-        etl.load_data()
+        etl.load_data(drop_tables=args.drop, resume=True, force=args.force)
     if args.index:
         etl.create_indexes()
